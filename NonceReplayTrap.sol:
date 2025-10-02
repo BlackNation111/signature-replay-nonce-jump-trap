@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {ITrap} from "drosera-contracts/interfaces/ITrap.sol";
+
+/// 
+@notice
+ Interface expected from monitored "signer" (mock / smart-wallet)
+interface IMonitoredSigner {
+    // Return a monotonic nonce for the signer (for EOAs this isn't available on-chain;
+    // we rely on smart-wallets or test mocks that expose a getter).
+    function getNonce() external view returns (uint256);
+
+    // Return a recent signature hash or identifier for the last signed payload (optional)
+    function lastSignatureHash() external view returns (bytes32);
+}
+
+/**
+ * @title NonceReplayTrap (Drosera-style)
+ * 
+@notice
+ Detects suspicious nonce jumps or repeated signature hashes (possible replay / compromise).
+ * 
+@dev
+ collect() is view and returns an encoded CollectOutput.
+ *      shouldRespond(...) is pure and expects the Drosera node to pass samples (newest first).
+ *
+ * Usage:
+ *  - Owner sets monitored signer using setMonitoredSigner(address).
+ *  - Node calls collect() every block (view) to capture (nonce, sigHash, block).
+ *  - Node passes samples into shouldRespond([...]) (data[0] is newest).
+ *  - Optionally pass a threshold (uint256 bps-like) as data[2] (first uint256) to override default jump threshold.
+ */
+contract NonceReplayTrap is ITrap {
+    address public owner;
+    address public monitoredSigner; // smart-wallet or mock exposing getNonce()
+    uint256 public jumpThreshold = 5; // default jump threshold (nonce gap) — 5 by default
+
+    event ConfigUpdated(address indexed setter, address monitoredSigner, uint256 jumpThreshold);
+    event NonceAnomalyDetected(address indexed signer, uint256 prevNonce, uint256 currNonce, uint256 delta, string reason, uint256 blockNumber);
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "only owner");
+        _;
+    }
+
+    /// Owner can set which signer to monitor
+    function setMonitoredSigner(address _s) external onlyOwner {
+        monitoredSigner = _s;
+        emit ConfigUpdated(msg.sender, monitoredSigner, jumpThreshold);
+    }
+
+    /// Owner can configure the default jump threshold
+    function setJumpThreshold(uint256 _threshold) external onlyOwner {
+        require(_threshold > 0, "threshold>0");
+        jumpThreshold = _threshold;
+        emit ConfigUpdated(msg.sender, monitoredSigner, jumpThreshold);
+    }
+
+    // --- CollectOutput snapshot structure ---
+    struct CollectOutput {
+        address signer;
+        uint256 nonce;
+        bytes32 sigHash; // optional last signature identifier
+        uint256 blockNumber;
+    }
+
+    /// 
+@notice
+ Collect current signer state (view-only)
+    /// 
+@dev
+ Uses try/catch in case the monitored signer doesn't implement methods.
+    function collect() external view returns (bytes memory) {
+        address s = monitoredSigner;
+        uint256 n = 0;
+        bytes32 h = bytes32(0);
+
+        if (s != address(0)) {
+            // try to read nonce
+            try IMonitoredSigner(s).getNonce() returns (uint256 _n) {
+                n = _n;
+            } catch {
+                n = 0;
+            }
+
+            // try to read last signature hash
+            try IMonitoredSigner(s).lastSignatureHash() returns (bytes32 _h) {
+                h = _h;
+            } catch {
+                h = bytes32(0);
+            }
+        }
+
+        CollectOutput memory out = CollectOutput({
+            signer: s,
+            nonce: n,
+            sigHash: h,
+            blockNumber: block.number
+        });
+
+        return abi.encode(out);
+    }
+
+    /// 
+@notice
+ shouldRespond analyzes recent samples and returns (true, payload) if anomaly detected
+    /// 
+@dev
+ data[0] = newest, data[1] = previous. Optional data[2] can contain uint256 threshold override.
+    function shouldRespond(bytes[] calldata data) external pure override returns (bool, bytes memory) {
+        if (data.length < 2) {
+            return (false, "");
+        }
+
+        CollectOutput memory curr = abi.decode(data[0], (CollectOutput));
+        CollectOutput memory prev = abi.decode(data[1], (CollectOutput));
+
+        // If signer not set, nothing to do
+        if (curr.signer == address(0) || prev.signer == address(0)) {
+            return (false, abi.encode(curr));
+        }
+
+        // Ensure we're observing same signer
+        if (curr.signer != prev.signer) {
+            // different signers in samples -> ignore (could be config mismatch)
+            return (false, abi.encode(curr));
+        }
+
+        uint256 delta = 0;
+        if (curr.nonce > prev.nonce) {
+            delta = curr.nonce - prev.nonce;
+        }
+
+        // Determine threshold: if caller passed a uint256 in data[2], decode and use it;
+        // otherwise use default of 5.
+        uint256 threshold = _extractThresholdFromData(data, 2);
+
+        bool repeatedSig = (curr.sigHash != bytes32(0) && curr.sigHash == prev.sigHash);
+
+        bool triggered = false;
+        string memory reason = "";
+
+        if (delta >= threshold && delta > 0) {
+            triggered = true;
+            reason = "nonce_jump";
+        } else if (repeatedSig) {
+            triggered = true;
+            reason = "repeated_signature";
+        }
+
+        // Pack response payload for off-chain / response contract
+        bytes memory payload = abi.encode(curr.signer, prev.nonce, curr.nonce, delta, reason, curr.blockNumber);
+
+        return (triggered, payload);
+    }
+
+    // Helper to extract threshold uint256 if provided as data[idx], else default 5
+    function _extractThresholdFromData(bytes[] calldata data, uint256 idx) internal pure returns (uint256) {
+        if (data.length > idx && data[idx].length >= 32) {
+            uint256 val = abi.decode(data[idx], (uint256));
+            if (val > 0) return val;
+        }
+        return 5;
+    }
+}
